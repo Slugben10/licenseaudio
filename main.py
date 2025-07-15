@@ -1,4 +1,34 @@
 #!/usr/bin/env python3
+# --- LICENSE VALIDATION WRAPPER (DO NOT MODIFY EXISTING APP LOGIC) ---
+import sys
+import os
+
+# License validation: import and call check_license before any app logic
+try:
+    from license_client import check_license
+except ImportError:
+    # Try to import from current directory if not in path
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("license_client", os.path.join(os.path.dirname(__file__), "license_client.py"))
+    license_client = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(license_client)
+    check_license = license_client.check_license
+
+LICENSE_API_URL = "https://demo.freshlook.hu/license-api/verify_license.php"
+
+# Allow up to 3 attempts for license validation
+_attempts = 0
+while _attempts < 3:
+    if check_license(LICENSE_API_URL):
+        break
+    _attempts += 1
+    if _attempts < 3:
+        print(f"\nLicense validation failed. Attempts remaining: {3 - _attempts}\n")
+    else:
+        print("\nLicense validation failed after 3 attempts. Exiting application.")
+        sys.exit(1)
+# --- END LICENSE VALIDATION WRAPPER ---
+
 # Disable screen access check
 import os
 import sys
