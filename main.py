@@ -343,6 +343,11 @@ except ImportError:
     # Silently set flag without showing warning
     pass
 
+# --- LANGUAGE CODE MAPPING FOR AZURE SPEECH SDK ---
+AZURE_SPEECH_LANGUAGE_CODES = {
+    "en": "en-US",
+    "hu": "hu-HU"
+}
 
 # Simple CLI version for when GUI is not available
 def run_cli():
@@ -714,12 +719,14 @@ class AudioProcessor:
                 api_key = speech_config["api_key"]
                 region = speech_config["region"]
                 speech_config_obj = speechsdk.SpeechConfig(subscription=api_key, region=region)
+                # --- LANGUAGE CODE PATCH (must be BEFORE recognizer is created) ---
+                if language:
+                    azure_lang_code = AZURE_SPEECH_LANGUAGE_CODES.get(language, "en-US")
+                    speech_config_obj.speech_recognition_language = azure_lang_code
                 # Enable word-level timestamps
                 speech_config_obj.request_word_level_timestamps()
                 audio_input = speechsdk.AudioConfig(filename=chunk_path)
                 recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config_obj, audio_config=audio_input)
-                if language:
-                    speech_config_obj.speech_recognition_language = language
                 segments = []
                 done = threading.Event()
                 def handle_final(evt):
@@ -3653,6 +3660,9 @@ Troubleshooting:
         import traceback
         import logging
 
+        # --- ENSURE WAV FOR DIARIZATION ---
+        wav_path, is_temp_wav = self.ensure_wav_for_diarization(audio_file_path)
+
         # Setup logger
         logger = logging.getLogger("DiarizationLogger")
         logger.setLevel(logging.DEBUG)
@@ -3675,9 +3685,9 @@ Troubleshooting:
             if not hasattr(self, 'word_by_word') or not self.word_by_word:
                 logger.warning("No word timestamps available, but continuing with diarization")
             
-            if not audio_file_path or not os.path.exists(audio_file_path):
-                logger.error(f"Audio file not found: {audio_file_path}")
-                raise RuntimeError(f"Audio file not found: {audio_file_path}")
+            if not wav_path or not os.path.exists(wav_path):
+                logger.error(f"Audio file not found: {wav_path}")
+                raise RuntimeError(f"Audio file not found: {wav_path}")
 
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             pipeline = Pipeline.from_pretrained(
@@ -3688,7 +3698,7 @@ Troubleshooting:
 
             # Step 1: Chunking (reuse existing logic)
             chunk_duration = 600  # 10 minutes
-            with sf.SoundFile(audio_file_path) as f:
+            with sf.SoundFile(wav_path) as f:
                 total_duration = f.frames / f.samplerate
                 sr = f.samplerate
             num_chunks = math.ceil(total_duration / chunk_duration)
@@ -3709,7 +3719,7 @@ Troubleshooting:
                 self.update_status(f"Diarizing chunk {idx+1}/{num_chunks}...", percent=0.10 + 0.7 * (idx / num_chunks))
                 start_frame = int(start * sr)
                 end_frame = int(end * sr)
-                waveform, _ = sf.read(audio_file_path, start=start_frame, stop=end_frame)
+                waveform, _ = sf.read(wav_path, start=start_frame, stop=end_frame)
                 if waveform.ndim > 1:
                     waveform = np.mean(waveform, axis=1)
                 waveform = waveform.astype(np.float32)
@@ -4126,6 +4136,48 @@ Troubleshooting:
         
         dialog.Destroy()
 
+    # --- NEW: Ensure WAV for diarization ---
+    def ensure_wav_for_diarization(self, audio_path):
+        import os
+        import subprocess
+        import sys
+        import shutil
+        # If already a .wav file, just return
+        if audio_path.lower().endswith('.wav'):
+            return audio_path, False
+        # --- Always use bundled FFmpeg ---
+        ffmpeg_path = None
+        # PyInstaller _MEIPASS (bundled) location
+        if hasattr(sys, '_MEIPASS'):
+            candidate = os.path.join(sys._MEIPASS, 'ffmpeg', 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg')
+            if os.path.isfile(candidate):
+                ffmpeg_path = candidate
+        # If not PyInstaller, check local ffmpeg/ffmpeg.exe in app dir
+        if not ffmpeg_path:
+            app_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+            candidate = os.path.join(app_dir, 'ffmpeg', 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg')
+            if os.path.isfile(candidate):
+                ffmpeg_path = candidate
+        # If still not found, show error and abort
+        if not ffmpeg_path:
+            self.show_error(
+                "FFmpeg is required for audio conversion but was not found in the bundled app.\n"
+                "Please contact support or reinstall the application.\n"
+                "(Developer: Make sure ffmpeg is bundled in the 'ffmpeg' folder in the app directory or PyInstaller _MEIPASS.)"
+            )
+            raise RuntimeError("Bundled FFmpeg not found.")
+        # Prepare output path
+        base, _ = os.path.splitext(audio_path)
+        wav_path = base + '_for_diarization.wav'
+        # Convert to 16kHz mono WAV using bundled FFmpeg
+        try:
+            cmd = [ffmpeg_path, '-y', '-i', audio_path, '-ar', '16000', '-ac', '1', wav_path]
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except Exception as e:
+            self.show_error(f"Failed to convert {audio_path} to WAV for diarization using bundled FFmpeg: {e}")
+            raise RuntimeError(f"Failed to convert {audio_path} to WAV for diarization: {e}")
+        return wav_path, True
+
 class LLMProcessor:
     """LLM processing functionality for chat and summarization."""
     def __init__(self, client, config_manager, update_callback=None):
@@ -4206,15 +4258,21 @@ class LLMProcessor:
             if template_name in templates:
                 template = templates[template_name]
                 prompt += f" Follow this template format:\n\n{template}"
-                
+        
         prompt += f"\n\nTranscript:\n{transcript}"
         
         try:
             chat_deployment = self.config_manager.get_azure_deployment("chat")
+            # --- PATCH: If transcript is Hungarian, add a system message in Hungarian ---
+            language = self.config_manager.get_language()
+            if language == "hu":
+                system_message = "Te egy magyar nyelvű asszisztens vagy, aki összefoglalja a beszélgetéseket magyarul."
+            else:
+                system_message = "You are an assistant that specializes in summarizing transcripts."
             response = self.client.chat.completions.create(
                 model=chat_deployment,
                 messages=[
-                    {"role": "system", "content": "You are an assistant that specializes in summarizing transcripts."},
+                    {"role": "system", "content": system_message},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.5
